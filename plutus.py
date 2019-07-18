@@ -7,23 +7,90 @@
 # ------------------------------------------------
 # Added convert to pickle from csv - July 2019 - AirShark
 # https://github.com/AirShark/Plutus
+# ------------------------------------------------
+# Added Altcoins - Compressed Keys - Secp256k1 CRPRNG- July 2019 - Jiloumed
+# https://github.com/Jiloumed/Plutus
 
 import os
 import pickle
 import hashlib
 import binascii
-import multiprocessing
-from fastecdsa import keys, curve
+#import multiprocessing
+#from fastecdsa import keys, curve
 
-DATABASE = r'database/JUL_06_2019/'
+DATABASE = r'database/JUL_13_2019/'
 
-def generate_private_key(): 
-    """
-    Generate a random 32-byte hex integer which serves as a randomly 
-    generated Bitcoin private key.
-    Average Time: 0.0000061659 seconds
-    """
-    return binascii.hexlify(os.urandom(32)).decode('utf-8').upper()
+"""
+Start from a random seed
+then generat Bitcoin private keys from x coords.
+Average Time: 0.0000000000 seconds
+"""
+seed =  0xdeadbeef
+
+modp = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+r = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
+gz = 0x1
+
+def inverse_mod(a, m):
+    if a < 0 or m <= a: a = a % m
+    c, d = a, m
+    uc, vc, ud, vd = 1, 0, 0, 1
+    while c != 0:
+        q, c, d = divmod(d, c) + (c,)
+        uc, vc, ud, vd = ud - q*uc, vd - q*vc, uc, vc
+    if ud > 0: return ud
+    else: return ud + m
+
+def from_jacobian(Xp, Yp, Zp):
+    z = inverse_mod(Zp, modp)
+    return (Xp * z**2) % modp, (Yp * z**3) % modp
+
+def bit_to_add(a):
+    d=[]
+    bitl= a.bit_length()
+    for i in range(bitl):
+        c = a | (1 << i)
+        if c == a: d.append(2**i)
+    return d
+
+def double_gen_point(x, y, z):
+    points = {1:[x, y, z]}
+    for i in range(1, r.bit_length()):
+        x, y, z = double(x, y, z)
+        points[2**i] = [x, y, z]
+    return points
+
+def double(x, y, z):
+    s = 4 * x * y**2 % modp
+    m = 3 * x**2 % modp
+    x1 = (m**2 - 2 * s) % modp
+    y1 = (m * (s - x1) - 8 * y**4) % modp
+    z1 = 2 * y * z % modp
+    return x1, y1, z1
+
+def add(Xp, Yp, Zp, Xq, Yq, Zq):
+    if not Yp: return (Xq, Yq, Zq)
+    if not Yq: return(Xp, Yp, Zp)
+    u1 = (Xp * Zq**2) % modp
+    u2 = (Xq * Zp**2) % modp
+    s1 = (Yp * Zq**3) % modp
+    s2 = (Yq * Zp**3) % modp
+    if u1 == u2:
+        if s1 != s2: return(0,0,1)
+        return jacobian_double(Xp, Yp, Zp)
+    h = u2 - u1
+    rs = s2 - s1
+    h2 = (h * h) % modp
+    h3 = (h * h2) % modp
+    u1h2 = (u1 * h2) % modp
+    nx = (rs**2 - h3 - 2*u1h2) % modp
+    ny = (rs*(u1h2 - nx) - s1 * h3) % modp
+    nz = (h*Zp*Zq) % modp
+    return nx, ny, nz
+
+dbgen = double_gen_point(gx, gy, gz)
 
 def private_key_to_public_key(private_key):
     """
@@ -34,33 +101,31 @@ def private_key_to_public_key(private_key):
     Average Time: 0.0016401287 seconds
     """
     # get the public key corresponding to the private key we just generated
-    c = int('0x%s'%private_key,0)
-    d = keys.get_public_key(c, curve.secp256k1)
-    return '04%s%s'%('{0:x}'.format(int(d.x)), '{0:x}'.format(int(d.y)))
+    if private_key in dbgen: return from_jacobian(dbgen[private_key][0], dbgen[private_key][1], dbgen[private_key][2])
+    btad = bit_to_add(private_key)
+    publicKey = dbgen[btad[0]]
+    for i in btad[1:]:
+        publicKey = add(publicKey[0], publicKey[1], publicKey[2], dbgen[i][0], dbgen[i][1], dbgen[i][2])
+    publicKey = from_jacobian(publicKey[0], publicKey[1], publicKey[2])
+    xpublicKey = "%064x" % publicKey[0]
+    global seed
+    seed = publicKey[0] #update next seed
+    if publicKey[1] % 2 == 1: # If the Y value for the Public Key is odd.
+        return "03" + xpublicKey.upper()
+    else: # Or else, if the Y value is even.
+        return "02" + xpublicKey.upper()
 
 def public_key_to_address(public_key):
     """
-    Accept a public key and convert it to its resepective P2PKH wallet address.
+    Accept a public key and convert it to its resepective P2PKH wallet RipeMD-160 address.
     Average Time: 0.0000801390 seconds
     """
-    output = []
-    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
     var = hashlib.new('ripemd160')
-    try:
-        var.update(hashlib.sha256(binascii.unhexlify(public_key.encode())).digest())
-        var = '00' + var.hexdigest() + hashlib.sha256(hashlib.sha256(binascii.unhexlify(('00' + var.hexdigest()).encode())).digest()).hexdigest()[0:8]
-        count = [char != '0' for char in var].index(True) // 2
-        n = int(var, 16)
-        while n > 0:
-            n, remainder = divmod(n, 58)
-            output.append(alphabet[remainder])
-        for i in range(count): output.append(alphabet[0])
-        return ''.join(output[::-1])
-    except:
-        # Skip if public_key gen caused an error - I think this happens because urandom was smaller than 32 bytes?
-        return -1
+    encoding = binascii.unhexlify(public_key.encode())
+    var.update(hashlib.sha256(encoding).digest())
+    return var.hexdigest()
 
-def process(private_key, public_key, address, database):
+def process(private_key, address, database):
     """
     Accept an address and query the database. If the address is found in the 
     database, then it is assumed to have a balance and the wallet data is 
@@ -73,37 +138,8 @@ def process(private_key, public_key, address, database):
         address in database[2] or \
         address in database[3] or \
         address in database[4]:
-        with open('plutus.txt', 'a') as file:
-            file.write('hex private key: ' + str(private_key) + '\n' +
-                    'WIF private key: ' + str(private_key_to_WIF(private_key)) + '\n' +
-                    'public key: ' + str(public_key) + '\n' +
-                    'address: ' + str(address) + '\n\n')
-    else: 
-        # Is printing every address slowing the process down since it has to write to STDOUT?
-        #print(str(private_key),":",str(address))
-        print('\r' + str(address), end = "")
-
-def private_key_to_WIF(private_key):
-    """
-    Convert the hex private key into Wallet Import Format for easier wallet 
-    importing. This function is only called if a wallet with a balance is 
-    found. Because that event is rare, this function is not significant to the 
-    main pipeline of the program and is not timed.
-    """
-    var = hashlib.sha256(binascii.unhexlify(hashlib.sha256(binascii.unhexlify('80' + private_key)).hexdigest())).hexdigest()
-    var = binascii.unhexlify('80' + private_key + var[0:8])
-    alphabet = chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-    value = pad = 0
-    result = ''
-    for i, c in enumerate(var[::-1]): value += 256**i * c
-    while value >= len(alphabet):
-        div, mod = divmod(value, len(alphabet))
-        result, value = chars[mod] + result, div
-    result = chars[value] + result
-    for c in var:
-        if c == 0: pad += 1
-        else: break
-    return chars[0] * pad + result
+        with open('plutus.csv', 'a') as file:
+            file.write(hex(private_key) + ';' + str(address) + '\n')
 
 def main(database):
     """
@@ -113,13 +149,10 @@ def main(database):
     one process.
     """
     while True:
-        private_key = generate_private_key()                    # 0.0000061659 seconds
-        public_key = private_key_to_public_key(private_key)     # 0.0016401287 seconds
-        address = public_key_to_address(public_key)             # 0.0000801390 seconds
-        if address != -1:
-            process(private_key, public_key, address, database) # 0.0000026941 seconds
-                                                                # --------------------
-                                                                # 0.0017291287 seconds
+        private_key = seed
+        public_key = private_key_to_public_key(private_key)
+        address = public_key_to_address(public_key)
+        process(private_key, address, database)
     
 if __name__ == '__main__':
     """
@@ -144,9 +177,12 @@ if __name__ == '__main__':
                 if c < half + quarter: database[2] = database[2] | pickle.load(file)
                 else: database[3] = database[3] | pickle.load(file)
     print('DONE')
-
     # To verify the database size, remove the # from the line below
     #print('database size: ' + str(sum(len(i) for i in database))); quit()
 
-    for cpu in range(multiprocessing.cpu_count()):
-        multiprocessing.Process(target = main, args = (database, )).start()
+    #for cpu in range(multiprocessing.cpu_count()):
+    #    multiprocessing.Process(target = main, args = (database, )).start()
+    try:
+        main(database)
+    except KeyboardInterrupt:
+        print("Next Seed: "+hex(seed))
